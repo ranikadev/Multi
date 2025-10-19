@@ -70,8 +70,10 @@ def load_accounts():
 
 accounts = load_accounts()
 clients = []
+from tweepy import OAuth1UserHandler  # For v1.1 API
 for i, acc in enumerate(accounts):
     try:
+        # v2 Client
         client = tweepy.Client(
             bearer_token=acc["bearer_token"],
             consumer_key=acc["api_key"],
@@ -80,7 +82,19 @@ for i, acc in enumerate(accounts):
             access_token_secret=acc["access_secret"],
             wait_on_rate_limit=True
         )
-        clients.append({"client": client, "name": f"Account_{i+1}"})
+        # v1.1 API for media upload
+        auth = OAuth1UserHandler(
+            acc["api_key"],
+            acc["api_secret"],
+            acc["access_token"],
+            acc["access_secret"]
+        )
+        api = tweepy.API(auth)
+        clients.append({
+            "client": client,  # v2 for posting
+            "api": api,       # v1.1 for upload
+            "name": f"Account_{i+1}"
+        })
         print(f"✅ Loaded {clients[-1]['name']}")
     except Exception as e:
         print(f"❌ Failed to load Account_{i+1}: {e}")
@@ -124,7 +138,7 @@ def get_random_image():
         return None
     images = [f for f in os.listdir(IMAGES_DIR) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
     if not images:
-        print("⚠️ No images in {IMAGES_DIR}; skipping media.")
+        print(f"⚠️ No images in {IMAGES_DIR}; skipping media.")
         return None
     return os.path.join(IMAGES_DIR, random.choice(images))
 
@@ -207,7 +221,7 @@ def fetch_perplexity_analysis(tweet_text):
     url = "https://api.perplexity.ai/chat/completions"
     headers = {"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"}
     data = {
-        "model": "sonar",
+        "model": "sonar-pro",  # Fixed: Valid Perplexity model
         "messages": [
             {"role": "system", "content": "Respond with a short, clear Hindi political analysis under 260 words."},
             {"role": "user", "content": prompt}
@@ -217,7 +231,8 @@ def fetch_perplexity_analysis(tweet_text):
     try:
         r = requests.post(url, headers=headers, json=data, timeout=20)
         if r.status_code != 200:
-            print(f"❌ Perplexity API error {r.status_code}")
+            error_body = r.text  # Or r.json().get("error", {}).get("message", r.text)
+            print(f"❌ Perplexity API error {r.status_code}: {error_body}")
             return ""
         return clean_text(r.json()["choices"][0]["message"]["content"].strip())
     except Exception as e:
@@ -227,7 +242,8 @@ def fetch_perplexity_analysis(tweet_text):
 # ---------------- Multi-Account Reply with Media ----------------
 def post_reply_with_account(tweet_id, reply_text, client_info):
     account_name = client_info["name"]
-    client = client_info["client"]
+    client = client_info["client"]  # v2
+    api = client_info["api"]        # v1.1
     image_path = get_random_image() if ATTACH_MEDIA else None
 
     if not reply_text:
@@ -237,12 +253,12 @@ def post_reply_with_account(tweet_id, reply_text, client_info):
     try:
         media_ids = None
         if image_path:
-            # Step 1: Upload media
-            media = client.media_upload(image_path)
+            # Step 1: Upload media via v1.1 API
+            media = api.simple_upload(image_path)
             media_ids = [media.media_id]
             print(f"📎 [{account_name}] Uploaded media ID: {media.media_id}")
         
-        # Step 2: Create reply tweet
+        # Step 2: Create reply tweet via v2 Client
         if DRY_RUN:
             media_desc = f" with media: {os.path.basename(image_path)}" if image_path else ""
             print(f"💬 DRY RUN [{account_name}]: {reply_text}{media_desc}")
@@ -251,7 +267,7 @@ def post_reply_with_account(tweet_id, reply_text, client_info):
         resp = client.create_tweet(
             text=reply_text,
             media_ids=media_ids,
-            in_reply_to_tweet_id=tweet_id
+            in_reply_to_tweet_id=tweet_id  # Confirmed correct for Client v4+
         )
         print(f"✅ [{account_name}] Replied{' with media' if image_path else ''}! ID: {resp.data['id']}")
         log_action("reply_sent", {
@@ -316,6 +332,7 @@ def queue_reply():
 # ---------------- Run ----------------
 if __name__ == "__main__":
     print(f"🚀 Multi-Account Bot started in {MODE.upper()} mode with {len(clients)} accounts. Media: {ATTACH_MEDIA}")
+    print(f"Tweepy version: {tweepy.__version__}")  # Quick version check
     if MODE == "fetch_reply":
         fetch_and_reply()
     elif MODE == "reply_queue":
