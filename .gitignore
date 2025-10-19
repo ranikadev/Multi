@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+reply_queue.json
+recent_profiles.json
+bot_logs.json
