@@ -1,7 +1,9 @@
 # multi_account_twitter_bot.py
 # Full ready-to-run script for multi-account X/Twitter reply bot
 # Features: Fetch tweets via Apify, analyze via Perplexity, reply via multiple accounts with optional media
-# Setup: Fill .env, add profiles.txt, accounts.json (template), run `python multi_account_twitter_bot.py`
+# Modification: Fetches from 30 profiles (one each), selects the 10 most recent (by timestamp) from different profiles for replies
+# Optimization: Reduced delays to 1-5s for faster replies; parallel Perplexity calls (via threading) for speed
+# Setup: Fill .env, add profiles.txt (30+ profiles), accounts.json (template), run `python multi_account_twitter_bot.py`
 
 import os
 import json
@@ -13,6 +15,7 @@ from datetime import datetime
 from apify_client import ApifyClient
 import tweepy
 from dotenv import load_dotenv  # Optional: for .env loading
+from concurrent.futures import ThreadPoolExecutor, as_completed  # For parallel Perplexity
 
 # Load .env if present
 load_dotenv()
@@ -30,11 +33,15 @@ IMAGES_DIR = "images"  # Folder for media attachments (optional: add JPG/PNG fil
 # Settings
 ACTOR_ID = "Fo9GoU5wC270BgcBr"
 TWEETS_PER_PROFILE = 1
-PROFILES_PER_RUN = 10  # Fetch from 10 profiles for 10 tweets
+PROFILES_PER_RUN = 30  # Fetch from 30 profiles to get 30 posts, then select top 10 recent
+REPLIES_TO_PROCESS = 10  # Number of most recent posts to reply to (from different profiles)
 RECENT_MEMORY = 20
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 ATTACH_MEDIA = os.getenv("ATTACH_MEDIA", "false").lower() == "true"  # Toggle media upload
 MODE = os.environ.get("MODE", "fetch_reply")  # "fetch_reply" or "reply_queue"
+MIN_DELAY = int(os.getenv("MIN_DELAY", 1))  # Min delay in seconds (for faster: 1)
+MAX_DELAY = int(os.getenv("MAX_DELAY", 5))  # Max delay in seconds (for faster: 5)
+MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", 5))  # Max parallel Perplexity calls
 
 # ---------------- Clients & Accounts ----------------
 apify_client = ApifyClient(APIFY_TOKEN)
@@ -187,6 +194,7 @@ def fetch_tweets(profiles):
     for item in apify_client.dataset(run["defaultDatasetId"]).iterate_items():
         profile = item.get("profileUrl")
         text = item.get("postText") or item.get("text") or ""
+        timestamp = item.get("timestamp")  # Capture timestamp (ms Unix)
         if not text:
             continue
         if profile not in all_tweets:
@@ -194,19 +202,26 @@ def fetch_tweets(profiles):
         if len(all_tweets[profile]) < TWEETS_PER_PROFILE:
             all_tweets[profile].append({
                 "id": item.get("postId"),
-                "text": text
+                "text": text,
+                "timestamp": timestamp  # Include for sorting
             })
 
-    # Flatten to list of 10 tweets (prioritize one per profile)
+    # Flatten to list with profile and timestamp
     fetched_tweets = []
     for profile, tweets in all_tweets.items():
         for tweet in tweets[:TWEETS_PER_PROFILE]:
-            fetched_tweets.append(tweet)
-            if len(fetched_tweets) >= PROFILES_PER_RUN:
-                break
-        if len(fetched_tweets) >= PROFILES_PER_RUN:
-            break
-    print(f"📊 Fetched {len(fetched_tweets)} tweets.")
+            fetched_tweets.append({
+                "id": tweet["id"],
+                "text": tweet["text"],
+                "timestamp": tweet["timestamp"],
+                "profile": profile
+            })
+
+    # Sort by timestamp descending (most recent first)
+    fetched_tweets.sort(key=lambda x: x["timestamp"], reverse=True)
+    # Take top REPLIES_TO_PROCESS (10 most recent, from different profiles)
+    fetched_tweets = fetched_tweets[:REPLIES_TO_PROCESS]
+    print(f"📊 Fetched {len(fetched_tweets)} most recent tweets from {len(all_tweets)} profiles.")
     return fetched_tweets
 
 # ---------------- Perplexity ----------------
@@ -221,7 +236,7 @@ def fetch_perplexity_analysis(tweet_text):
     url = "https://api.perplexity.ai/chat/completions"
     headers = {"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"}
     data = {
-        "model": "sonar-pro",  # Fixed: Valid Perplexity model
+        "model": "sonar-pro",  # Valid Perplexity model
         "messages": [
             {"role": "system", "content": "Respond with a short, clear Hindi political analysis under 260 words."},
             {"role": "user", "content": prompt}
@@ -238,6 +253,23 @@ def fetch_perplexity_analysis(tweet_text):
     except Exception as e:
         print(f"❌ Perplexity error: {e}")
         return ""
+
+# Parallel Perplexity processor
+def generate_replies_parallel(tweets):
+    """Generate replies for all tweets in parallel."""
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
+        future_to_tweet = {
+            executor.submit(fetch_perplexity_analysis, tweet["text"]): tweet for tweet in tweets
+        }
+        for future in as_completed(future_to_tweet):
+            tweet = future_to_tweet[future]
+            try:
+                reply = future.result()
+                tweet["reply_text"] = reply
+            except Exception as e:
+                print(f"❌ Parallel Perplexity error for {tweet['id']}: {e}")
+                tweet["reply_text"] = ""
+    return tweets
 
 # ---------------- Multi-Account Reply with Media ----------------
 def post_reply_with_account(tweet_id, reply_text, client_info):
@@ -290,16 +322,23 @@ def fetch_and_reply():
         print("⚠️ No tweets fetched.")
         return
 
+    # Generate all replies in parallel for speed
+    print("🤖 Generating replies in parallel...")
+    fetched_tweets = generate_replies_parallel(fetched_tweets)
+
     replies_sent = 0
     for idx, tweet in enumerate(fetched_tweets):
+        # Skip if no reply generated
+        if not tweet.get("reply_text"):
+            print(f"⚠️ Skipping tweet {tweet['id']} (no reply).")
+            continue
         # Round-robin accounts
         client_info = clients[idx % len(clients)]
-        reply_text = fetch_perplexity_analysis(tweet["text"])
-        delay = random.randint(10, 30)
-        print(f"\n📜 Tweet {idx+1}: {tweet['text'][:120]}...")
+        delay = random.randint(MIN_DELAY, MAX_DELAY)
+        print(f"\n📜 Tweet {idx+1} (from {tweet['profile']}): {tweet['text'][:120]}...")
         print(f"⏳ [{client_info['name']}] Waiting {delay}s...")
         time.sleep(delay)
-        if post_reply_with_account(tweet["id"], reply_text, client_info):
+        if post_reply_with_account(tweet["id"], tweet["reply_text"], client_info):
             replies_sent += 1
 
     print(f"\n🎉 Fetch+Reply complete: {replies_sent}/{len(fetched_tweets)} replies sent.")
@@ -316,15 +355,21 @@ def queue_reply():
             queued_tweets.append({**tweet, "profile": profile})
     random.shuffle(queued_tweets)  # Randomize for distribution
 
+    # Generate replies in parallel
+    print("🤖 Generating queued replies in parallel...")
+    queued_tweets = generate_replies_parallel(queued_tweets)
+
     replies_sent = 0
     for idx, tweet_data in enumerate(queued_tweets[:len(clients)]):  # Limit to num accounts
+        if not tweet_data.get("reply_text"):
+            print(f"⚠️ Skipping queued tweet {tweet_data['id']} (no reply).")
+            continue
         client_info = clients[idx % len(clients)]
-        reply_text = fetch_perplexity_analysis(tweet_data["text"])
-        delay = random.randint(10, 30)
+        delay = random.randint(MIN_DELAY, MAX_DELAY)
         print(f"\n📜 Queued tweet: {tweet_data['text'][:120]}...")
         print(f"⏳ [{client_info['name']}] Waiting {delay}s...")
         time.sleep(delay)
-        if post_reply_with_account(tweet_data["id"], reply_text, client_info):
+        if post_reply_with_account(tweet_data["id"], tweet_data["reply_text"], client_info):
             replies_sent += 1
             # Remove from queue (simplified)
     print(f"\n🎉 Queue reply complete: {replies_sent} replies sent.")
@@ -333,6 +378,7 @@ def queue_reply():
 if __name__ == "__main__":
     print(f"🚀 Multi-Account Bot started in {MODE.upper()} mode with {len(clients)} accounts. Media: {ATTACH_MEDIA}")
     print(f"Tweepy version: {tweepy.__version__}")  # Quick version check
+    print(f"Delays: {MIN_DELAY}-{MAX_DELAY}s, Parallel: {MAX_PARALLEL}")
     if MODE == "fetch_reply":
         fetch_and_reply()
     elif MODE == "reply_queue":
